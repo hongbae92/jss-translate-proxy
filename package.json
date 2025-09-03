@@ -1,13 +1,9 @@
 {
-  "name": "jss-translate-proxy",
+  "name": "jssfroxi",
   "version": "1.0.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod"
-  },
-  "devDependencies": {
-    "@vercel/node": "^3.0.0",
-    "typescript": "^5.4.0"
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {
+    "@vercel/node": "^3.0.0"
   }
 }
