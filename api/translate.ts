@@ -82,6 +82,35 @@ function toBase64Utf8(s: string) {
   return Buffer.from(s ?? "", "utf8").toString("base64");
 }
 
+/** CHANGED: 타겟 언어 정규화(사람친화 → 코드) */
+function normalizeTargetLang(input?: string) {
+  const raw = (input || '').trim().toLowerCase();
+  // 우즈벡 라틴 다양한 표기 허용
+  const uzLatnAliases = [
+    'uz-latn','uz_latn','uz latn',
+    'uzbek (latin)','uzbek latin','uzbek-latin','uzbek_latin','uzbek latin alphabet',
+    'o\'zbek lotin','ozbek lotin','oʻzbek lotin'
+  ];
+  if (uzLatnAliases.includes(raw)) return { code: 'uz-Latn', label: 'Uzbek (Latin)' };
+
+  // (필요 시 여기서 다른 언어도 추가 가능)
+  return { code: 'uz-Latn', label: 'Uzbek (Latin)' }; // 기본값
+}
+
+/** CHANGED: 우즈벡 라틴/ASCII 화이트리스트 검사 */
+function looksLikeUzbekLatin(s: string) {
+  if (!s) return false;
+  // 허용: A-Z a-z 숫자 공백, 기본 구두점, 아포스트로피('), 우즈벡 라틴에서 쓰는 ʼ(02BC)/ʻ(02BB)
+  const re = /^[A-Za-z0-9\s\.\,\;\:\'\"\!\?\-\(\)\/\u02BB\u02BC]+$/;
+  return re.test(s);
+}
+
+/** CHANGED: 사과/설명/불필요 문장 패턴(우즈벡/영어) */
+function looksLikeApologyOrMeta(s: string) {
+  const t = s.trim().toLowerCase();
+  return /^(kechirasiz|uzr|sorry|i (cannot|can't)|as an ai|men (tushunmadim|bila olmayman))/.test(t);
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(res);
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -113,26 +142,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // ================= (A) 번역 모드 =================
     if (typeof body.text === 'string' && typeof body.targetLang === 'string') {
-      const text: string = body.text;
-      const targetLang: string = body.targetLang || 'Uzbek (Latin)';
+      const sourceText: string = body.text;
+      const { code: targetCode, label: targetLabel } = normalizeTargetLang(body.targetLang); // CHANGED
 
-      // 라틴 고정 & 사과문 금지
+      // CHANGED: 더 엄격한 시스템 프롬프트 + 문자셋 제약
       const systemPrompt = `
-You are a translator. Translate the USER text into ${targetLang} (Uzbek Latin, NOT Cyrillic).
+You are a professional translator.
+Translate the USER text into Uzbek (Latin, ${targetCode}). Use only the Uzbek Latin alphabet and ASCII punctuation.
 Rules:
-- Always translate the given text literally and naturally.
-- NEVER say you didn't understand. NEVER ask for clarification.
-- Output ONLY the translated text. No explanations.
-- Preserve punctuation and line breaks. Keep placeholders/code as-is.
+- Translate literally but naturally.
+- Output ONLY the translated text. No explanations or apologies.
+- Do not add any extra sentences.
+- Keep placeholders/code as-is and preserve punctuation/line breaks.
+- Do not use Cyrillic, Arabic, or Korean characters.
 `.trim();
 
       const payload = {
         model: body.model || DEFAULT_MODEL,
-        temperature: typeof body.temperature === 'number' ? body.temperature : 0.2,
+        temperature: 0, // CHANGED: 번역은 0으로 고정
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user',   content: text },
+          { role: 'user',   content: sourceText },
         ],
+        // response_format: { type: 'text' } // (필요 시 사용)
       };
 
       // 1차 요청
@@ -153,27 +185,37 @@ Rules:
         data?.choices?.[0]?.message ??
         '';
 
-      // 키릴로 내려오면 라틴으로 강제 변환
-      let result_latin = cyrToLatin(String(translatedRaw ?? ''));
+      // 키릴로 내려오면 라틴으로 강제 변환 + 아포스트로피 통일
+      let result_latin = unifyApostrophe(cyrToLatin(String(translatedRaw ?? ''))).trim();
 
-      // "Kechirasiz/Uzr…" 같은 사과문이면 한 번 더 재시도
-      const looksApology = /^(kechirasiz|uzr)/i.test(result_latin.trim());
-      if (looksApology) {
+      // CHANGED: 품질검사(설명문/비라틴 포함 시 재시도)
+      const needsRetry =
+        looksLikeApologyOrMeta(result_latin) ||
+        !looksLikeUzbekLatin(result_latin);
+
+      if (needsRetry) {
         const retry = await fetch(OPENAI_API_URL, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: body.model || DEFAULT_MODEL,
-            temperature: 0.2,
+            temperature: 0,
             messages: [
-              { role: 'system', content: `Translate to ${targetLang} (Uzbek Latin only). Output only the translation.` },
-              { role: 'user',   content: text }
+              { role: 'system', content: `
+Translate to Uzbek (Latin, ${targetCode}). Output only the translation.
+Use ONLY Uzbek Latin letters and ASCII punctuation.
+No explanations, no apologies, no extra sentences.`.trim() },
+              { role: 'user',   content: sourceText }
             ],
           }),
         });
-        const rj = await retry.json().catch(() => ({} as any));
-        const retr = String(rj?.choices?.[0]?.message?.content ?? '');
-        result_latin = cyrToLatin(retr) || result_latin;
+
+        if (retry.ok) {
+          const rj = await retry.json().catch(() => ({} as any));
+          const retr = String(rj?.choices?.[0]?.message?.content ?? '');
+          const fixed = unifyApostrophe(cyrToLatin(retr)).trim();
+          if (fixed) result_latin = fixed;
+        }
       }
 
       const result_ascii = toAsciiUzbek(result_latin);
@@ -182,10 +224,11 @@ Rules:
       return res.status(200).json({
         ok: true,
         mode: 'translate',
-        targetLang,
-        result: result_latin,   // 라틴 원문
-        result_ascii,           // ASCII 호환
-        result_b64              // 라틴 원문(Base64)
+        targetLang: targetLabel,                 // CHANGED: 사람친화 라벨
+        targetLangCode: targetCode,              // CHANGED: 코드도 함께 노출
+        result: result_latin,                    // 라틴 원문 (메인)
+        result_ascii,                            // ASCII 호환(보조 출력)
+        result_b64                               // 라틴(Base64)
       });
     }
 
