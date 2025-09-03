@@ -10,8 +10,14 @@ function setCors(res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 
+/** 특수 아포스트로피를 ASCII로 치환 */
+function asciiSafe(s: string) {
+  return s?.replace(/[\u2018\u2019\u02BC\u02BB]/g, "'");
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(res);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
   // Preflight
   if (req.method === 'OPTIONS') {
@@ -44,28 +50,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(500).json({ error: 'Missing OPENAI_API_KEY' });
     }
 
-    // ---- 바디 파싱(PowerShell 호환) ----
+    // ---- 바디 파싱 ----
     const body =
       typeof req.body === 'string'
         ? JSON.parse(req.body || '{}')
         : (req.body || {});
 
     // ===== (A) 번역 모드 =====
-    // 요청 예: { "text": "안녕하세요", "targetLang": "Uzbek (Latin)" }
     if (typeof body.text === 'string' && typeof body.targetLang === 'string') {
       const text: string = body.text;
-      const targetLang: string = body.targetLang; // 예: "Uzbek (Latin)" 또는 "Uzbek"
-
-      // 우즈벡(라틴) 기본값 처리
-      const target = targetLang || 'Uzbek (Latin)';
+      const targetLang: string = body.targetLang || 'Uzbek (Latin)';
 
       const systemPrompt = `
-You are a professional translator into ${target}.
+You are a professional translator into ${targetLang}.
 Rules:
 - Preserve original meaning, tone, formatting, punctuation, and line breaks.
 - Keep code blocks, JSON, placeholders (e.g., {name}, {{var}}, %s) exactly as-is.
 - Do NOT add explanations. Return ONLY the translated text.
-- If the source is already in ${target}, just return it as-is.
+- If the source is already in ${targetLang}, just return it as-is.
       `.trim();
 
       const payload = {
@@ -97,16 +99,17 @@ Rules:
         data?.choices?.[0]?.message ??
         null;
 
+      const safe = asciiSafe(String(translated ?? ''));
+
       return res.status(200).json({
         ok: true,
         mode: 'translate',
-        targetLang: target,
-        result: translated,
+        targetLang,
+        result: safe,
       });
     }
 
     // ===== (B) 프록시 모드 =====
-    // 요청 예: { "messages":[{role:"user",content:"Hi"}], "model":"gpt-4o-mini" }
     if (Array.isArray(body.messages)) {
       const payload = {
         model: body.model || DEFAULT_MODEL,
