@@ -40,9 +40,10 @@ function cyrToLatin(input: string) {
     'Э': 'E',  'э': 'e',
     'Ъ': "'",  'ъ': "'",
     'Ь': '',   'ь': '',
+    'Ж': 'J',  'ж': 'j',
     'А': 'A', 'а': 'a', 'Б': 'B', 'б': 'b', 'В': 'V', 'в': 'v',
     'Г': 'G', 'г': 'g', 'Д': 'D', 'д': 'd', 'Е': 'E', 'е': 'e',
-    'Ж': 'J', 'ж': 'j', 'З': 'Z', 'з': 'z', 'И': 'I', 'и': 'i',
+    'З': 'Z', 'з': 'z', 'И': 'I', 'и': 'i',
     'К': 'K', 'к': 'k', 'Л': 'L', 'л': 'l', 'М': 'M', 'м': 'm',
     'Н': 'N', 'н': 'n', 'О': 'O', 'о': 'o', 'П': 'P', 'п': 'p',
     'Р': 'R', 'р': 'r', 'С': 'S', 'с': 's', 'Т': 'T', 'т': 't',
@@ -51,13 +52,13 @@ function cyrToLatin(input: string) {
 
   s = s.split('').map(ch => map[ch] ?? ch).join('');
 
-  // 조합형 o‘/g‘ 변형(혹시 남아있을 수 있는 다양한 기호들을 ')
+  // 조합형 o‘/g‘ 변형 → o' / g'
   s = s.replace(/o[\u02BB\u02BC]/gi, "o'")
        .replace(/g[\u02BB\u02BC]/gi, "g'");
   return unifyApostrophe(s);
 }
 
-/** 라틴을 ASCII 근사치로(최소 손실) */
+/** 라틴을 ASCII 근사치(콘솔/메모장 호환) */
 function toAsciiUzbek(s: string) {
   if (!s) return s;
   let t = unifyApostrophe(s)
@@ -72,7 +73,7 @@ function toAsciiUzbek(s: string) {
     .replace(/ú/g, "u").replace(/Ú/g, "U")
     .replace(/o[\u02BB\u02BC]/gi, "o'")
     .replace(/g[\u02BB\u02BC]/gi, "g'");
-  // 남은 비ASCII는 ?로 대체(콘솔/메모장 호환 목적)
+  // 남은 비ASCII는 ?로 대체(가시성 목적)
   t = t.replace(/[^\x20-\x7E]/g, "?");
   return t;
 }
@@ -115,12 +116,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const text: string = body.text;
       const targetLang: string = body.targetLang || 'Uzbek (Latin)';
 
+      // 라틴 고정 & 사과문 금지
       const systemPrompt = `
-You are a professional translator into ${targetLang}.
-- Output MUST be in Uzbek Latin alphabet (Lotin alifbosi), NOT Cyrillic.
-- Preserve meaning, tone, punctuation, and line breaks.
-- Keep code/JSON/placeholders ({name}, {{var}}, %s) exactly as-is.
-- Return ONLY the translated text (no explanations).
+You are a translator. Translate the USER text into ${targetLang} (Uzbek Latin, NOT Cyrillic).
+Rules:
+- Always translate the given text literally and naturally.
+- NEVER say you didn't understand. NEVER ask for clarification.
+- Output ONLY the translated text. No explanations.
+- Preserve punctuation and line breaks. Keep placeholders/code as-is.
 `.trim();
 
       const payload = {
@@ -132,6 +135,7 @@ You are a professional translator into ${targetLang}.
         ],
       };
 
+      // 1차 요청
       const resp = await fetch(OPENAI_API_URL, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
@@ -144,13 +148,34 @@ You are a professional translator into ${targetLang}.
       }
 
       const data = await resp.json();
-      const translatedRaw: string =
+      let translatedRaw: string =
         data?.choices?.[0]?.message?.content ??
         data?.choices?.[0]?.message ??
         '';
 
-      // 키릴로 내려와도 라틴으로 강제 변환
-      const result_latin = cyrToLatin(String(translatedRaw ?? ''));
+      // 키릴로 내려오면 라틴으로 강제 변환
+      let result_latin = cyrToLatin(String(translatedRaw ?? ''));
+
+      // "Kechirasiz/Uzr…" 같은 사과문이면 한 번 더 재시도
+      const looksApology = /^(kechirasiz|uzr)/i.test(result_latin.trim());
+      if (looksApology) {
+        const retry = await fetch(OPENAI_API_URL, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: body.model || DEFAULT_MODEL,
+            temperature: 0.2,
+            messages: [
+              { role: 'system', content: `Translate to ${targetLang} (Uzbek Latin only). Output only the translation.` },
+              { role: 'user',   content: text }
+            ],
+          }),
+        });
+        const rj = await retry.json().catch(() => ({} as any));
+        const retr = String(rj?.choices?.[0]?.message?.content ?? '');
+        result_latin = cyrToLatin(retr) || result_latin;
+      }
+
       const result_ascii = toAsciiUzbek(result_latin);
       const result_b64   = toBase64Utf8(result_latin);
 
